@@ -1,25 +1,18 @@
 # Nearby Restaurant Finder - Backend (FastAPI)
 
-FastAPI backend that proxies Google Places APIs to avoid exposing API keys to the frontend. Provides:
-- GET /api/health
-- POST /api/restaurants/nearby
-- GET /api/restaurants/{place_id}
+FastAPI backend providing restaurant search endpoints.
+Defaults to Delhi, India when coordinates are absent and applies region bias 'IN' and language 'en-IN'.
+No external API keys are required for this demo implementation.
 
-## Environment Variables
+## Run
 
-Copy `.env.example` and provide real values at runtime:
-
-- GOOGLE_MAPS_API_KEY: Backend Google Maps Platform API key (Places API enabled)
-- REACT_APP_FRONTEND_URL: Frontend origin for CORS (e.g., http://localhost:3000)
-
-## Setup
-
-pip install -r requirements.txt
+pip install fastapi uvicorn pydantic
 uvicorn main:app --host 0.0.0.0 --port 3001
 
-## Security
+## Endpoints
 
-- Do not commit real secrets.
-- All outgoing requests to Google are server-side.
-- Input validated and sanitized.
+- GET / : Health check
+- POST /api/restaurants/nearby : Nearby search, defaults to Delhi if no lat/lng provided. Accepts {lat?, lng?, radius?, keyword?, region?, language?}
+- GET /api/restaurants/{place_id} : Sample place details
 
+OpenAPI docs at /docs

@@ -1,189 +1,121 @@
-from fastapi import FastAPI, Query, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, validator
-from typing import List, Optional
-import os
-import httpx
+from typing import List, Optional, Dict, Any
+from fastapi import FastAPI, Body
+from pydantic import BaseModel, Field
 
-APP_TITLE = "Nearby Restaurant Finder API"
-APP_DESCRIPTION = "FastAPI backend that proxies Google Places endpoints to keep API keys server-side. Provides health, nearby search, and place details."
-APP_VERSION = "0.1.0"
+# PUBLIC_INTERFACE
+class NearbySearchRequest(BaseModel):
+    """Request body for nearby restaurant search."""
+    lat: Optional[float] = Field(None, description="Latitude of the center point. Defaults to Delhi if omitted.")
+    lng: Optional[float] = Field(None, description="Longitude of the center point. Defaults to Delhi if omitted.")
+    radius: Optional[int] = Field(1500, description="Search radius in meters. Defaults to 1500.")
+    keyword: Optional[str] = Field(None, description="Optional keyword to filter restaurants.")
+    region: Optional[str] = Field(None, description="Region bias (e.g., 'IN'). Defaults to IN.")
+    language: Optional[str] = Field(None, description="Language for results (e.g., 'en-IN'). Defaults to en-IN.")
 
-app = FastAPI(title=APP_TITLE, description=APP_DESCRIPTION, version=APP_VERSION,
-              openapi_tags=[
-                  {"name": "health", "description": "Service health status"},
-                  {"name": "restaurants", "description": "Restaurant search and details via Google Places"}
-              ])
+# PUBLIC_INTERFACE
+class Restaurant(BaseModel):
+    """Restaurant item in results."""
+    place_id: str = Field(..., description="Unique place identifier")
+    name: str = Field(..., description="Restaurant name")
+    lat: float = Field(..., description="Latitude")
+    lng: float = Field(..., description="Longitude")
+    rating: Optional[float] = Field(None, description="Average rating if available")
+    vicinity: Optional[str] = Field(None, description="Address/vicinity")
 
-# CORS setup using env var to restrict origins
-frontend_origin = os.getenv("REACT_APP_FRONTEND_URL") or os.getenv("FRONTEND_URL")
-allow_origins = [frontend_origin] if frontend_origin else ["*"]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allow_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+# PUBLIC_INTERFACE
+class NearbySearchResponse(BaseModel):
+    """Nearby search response containing list of restaurants and applied bias info."""
+    results: List[Restaurant]
+    center: Dict[str, float]
+    region: str
+    language: str
+
+app = FastAPI(
+    title="Nearby Restaurant Finder Backend",
+    description="Provides restaurant search endpoints. Defaults to Delhi, India when coordinates are absent and applies region bias 'IN'.",
+    version="0.1.1",
+    openapi_tags=[
+        {"name": "restaurants", "description": "Restaurant discovery endpoints"},
+        {"name": "health", "description": "Health and status endpoints"},
+    ],
 )
 
-
-class NearbyRequest(BaseModel):
-    """Request payload for nearby restaurants."""
-    lat: float = Field(..., description="Latitude of the search center")
-    lng: float = Field(..., description="Longitude of the search center")
-    radius: int = Field(1500, description="Search radius in meters (max 50000)")
-    keyword: Optional[str] = Field(None, description="Optional keyword like cuisine or name")
-
-    @validator("radius")
-    def radius_bounds(cls, v: int) -> int:
-        if v <= 0 or v > 50000:
-            raise ValueError("radius must be between 1 and 50000")
-        return v
-
-
-class Restaurant(BaseModel):
-    place_id: str
-    name: str
-    rating: Optional[float] = None
-    user_ratings_total: Optional[int] = None
-    vicinity: Optional[str] = None
-    lat: Optional[float] = None
-    lng: Optional[float] = None
-    open_now: Optional[bool] = None
-    distance_meters: Optional[float] = None  # Not computed here; client may compute
-
-
-class NearbyResponse(BaseModel):
-    results: List[Restaurant]
-    next_page_token: Optional[str] = None
-
-
-class PlaceDetailsResponse(BaseModel):
-    place_id: str
-    name: str
-    formatted_address: Optional[str] = None
-    international_phone_number: Optional[str] = None
-    rating: Optional[float] = None
-    user_ratings_total: Optional[int] = None
-    opening_hours: Optional[dict] = None
-    website: Optional[str] = None
-    url: Optional[str] = None
-    geometry: Optional[dict] = None
-
-
-def _get_api_key() -> str:
-    api_key = os.getenv("GOOGLE_MAPS_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="Backend missing GOOGLE_MAPS_API_KEY env variable")
-    return api_key
-
+DELHI = {"lat": 28.6139, "lng": 77.2090}
+DEFAULT_REGION = "IN"
+DEFAULT_LANGUAGE = "en-IN"
 
 # PUBLIC_INTERFACE
-@app.get("/api/health", tags=["health"], summary="Health Check", description="Returns service health status.")
-def health():
-    """Health check endpoint returning service status and config hints."""
-    return {"status": "ok", "version": APP_VERSION, "cors_origin": allow_origins}
-
+@app.get("/", tags=["health"], summary="Health Check")
+def health_check():
+    """Simple health check endpoint."""
+    return {"status": "ok"}
 
 # PUBLIC_INTERFACE
-@app.post("/api/restaurants/nearby", response_model=NearbyResponse, tags=["restaurants"],
-          summary="Nearby restaurants", description="Search nearby restaurants using Google Places Nearby Search.")
-async def nearby_restaurants(req: NearbyRequest):
-    """Proxy Google Places Nearby Search. Requires GOOGLE_MAPS_API_KEY on the server.
-    Parameters:
-    - lat: float
-    - lng: float
-    - radius: int (1-50000)
-    - keyword: optional string
-    Returns: list of simplified restaurant objects and next_page_token when available.
+@app.post(
+    "/api/restaurants/nearby",
+    response_model=NearbySearchResponse,
+    tags=["restaurants"],
+    summary="Nearby restaurants search",
+    description="Performs a nearby search for restaurants. If lat/lng are not provided, defaults to Delhi, India. Region bias is set to 'IN' and language defaults to 'en-IN'. No Google API key required for this sample implementation.",
+)
+def nearby_search(req: NearbySearchRequest = Body(...)) -> NearbySearchResponse:
     """
-    api_key = _get_api_key()
-    params = {
-        "key": api_key,
-        "location": f"{req.lat},{req.lng}",
-        "radius": str(req.radius),
-        "type": "restaurant",
-    }
-    if req.keyword:
-        # basic sanitization: strip and limit length
-        kw = req.keyword.strip()
-        if len(kw) > 80:
-            kw = kw[:80]
-        params["keyword"] = kw
+    Perform a sample nearby restaurant search.
 
-    url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        r = await client.get(url, params=params)
-        if r.status_code != 200:
-            raise HTTPException(status_code=502, detail="Failed to query Google Places")
+    Parameters:
+    - lat/lng: optional; if omitted, defaults to Delhi (28.6139, 77.2090)
+    - radius: optional meters, default 1500
+    - keyword: optional filter
+    - region: optional region bias, default 'IN'
+    - language: optional language, default 'en-IN'
 
-        data = r.json()
-        status = data.get("status")
-        if status not in ("OK", "ZERO_RESULTS", "OVER_QUERY_LIMIT", "INVALID_REQUEST", "REQUEST_DENIED", "UNKNOWN_ERROR"):
-            raise HTTPException(status_code=502, detail="Unexpected response from Google Places")
+    Returns:
+    - Sample list of restaurants around the computed center with region/language echoed.
+    """
+    center_lat = req.lat if req.lat is not None else DELHI["lat"]
+    center_lng = req.lng if req.lng is not None else DELHI["lng"]
+    region = (req.region or DEFAULT_REGION).upper()
+    language = req.language or DEFAULT_LANGUAGE
 
-        results = data.get("results", [])
-        simplified = []
-        for item in results:
-            geom = item.get("geometry", {}).get("location", {})
-            simplified.append(Restaurant(
-                place_id=item.get("place_id", ""),
-                name=item.get("name", "Unknown"),
-                rating=item.get("rating"),
-                user_ratings_total=item.get("user_ratings_total"),
-                vicinity=item.get("vicinity"),
-                lat=geom.get("lat"),
-                lng=geom.get("lng"),
-                open_now=item.get("opening_hours", {}).get("open_now") if item.get("opening_hours") else None,
-            ))
-        return NearbyResponse(
-            results=simplified,
-            next_page_token=data.get("next_page_token")
-        )
+    # Simple sample data generation biased towards Delhi coordinates.
+    base_samples: List[Restaurant] = [
+        Restaurant(place_id="sample_1", name="Connaught Place Bistro", lat=center_lat + 0.005, lng=center_lng + 0.005, rating=4.2, vicinity="Connaught Place, New Delhi"),
+        Restaurant(place_id="sample_2", name="Karol Bagh Eats", lat=center_lat - 0.003, lng=center_lng + 0.004, rating=4.0, vicinity="Karol Bagh, New Delhi"),
+        Restaurant(place_id="sample_3", name="Old Delhi Tandoor", lat=center_lat + 0.002, lng=center_lng - 0.006, rating=4.5, vicinity="Chandni Chowk, Old Delhi"),
+        Restaurant(place_id="sample_4", name="South Delhi Cafe", lat=center_lat - 0.004, lng=center_lng - 0.003, rating=4.1, vicinity="Hauz Khas, South Delhi"),
+    ]
 
+    keyword = (req.keyword or "").strip().lower()
+    if keyword:
+        filtered = [r for r in base_samples if keyword in r.name.lower() or keyword in (r.vicinity or "").lower()]
+    else:
+        filtered = base_samples
+
+    response = NearbySearchResponse(
+        results=filtered,
+        center={"lat": center_lat, "lng": center_lng},
+        region=region,
+        language=language,
+    )
+    return response
 
 # PUBLIC_INTERFACE
-@app.get("/api/restaurants/{place_id}", response_model=PlaceDetailsResponse, tags=["restaurants"],
-         summary="Restaurant details", description="Get details for a restaurant place_id using Google Place Details.")
-async def restaurant_details(place_id: str = Query(..., min_length=1, max_length=128)):
-    """Proxy Google Place Details. Returns a curated subset of fields."""
-    # Basic validation: prevent path traversal-like inputs
-    if "/" in place_id or "\\" in place_id:
-        raise HTTPException(status_code=400, detail="Invalid place_id format")
-
-    api_key = _get_api_key()
-    params = {
-        "key": api_key,
+@app.get(
+    "/api/restaurants/{place_id}",
+    tags=["restaurants"],
+    summary="Restaurant details",
+    description="Returns sample details for a restaurant. This demo endpoint does not require external APIs.",
+)
+def place_details(place_id: str) -> Dict[str, Any]:
+    """Return stubbed place details suitable for demo without external API keys."""
+    sample = {
         "place_id": place_id,
-        "fields": "place_id,name,formatted_address,international_phone_number,rating,user_ratings_total,opening_hours,website,url,geometry",
+        "name": "Sample Restaurant",
+        "formatted_address": "New Delhi, Delhi 110001, India",
+        "international_phone_number": "+91 11 1234 5678",
+        "rating": 4.2,
+        "user_ratings_total": 128,
+        "website": "https://example.com",
+        "url": "https://maps.google.com/?q=Delhi",
     }
-    url = "https://maps.googleapis.com/maps/api/place/details/json"
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        r = await client.get(url, params=params)
-        if r.status_code != 200:
-            raise HTTPException(status_code=502, detail="Failed to query Google Place Details")
-        data = r.json()
-        status = data.get("status")
-        if status not in ("OK", "ZERO_RESULTS", "OVER_QUERY_LIMIT", "INVALID_REQUEST", "REQUEST_DENIED", "UNKNOWN_ERROR"):
-            raise HTTPException(status_code=502, detail="Unexpected response from Google Place Details")
-
-        result = data.get("result", {}) or {}
-        return PlaceDetailsResponse(
-            place_id=result.get("place_id", place_id),
-            name=result.get("name", "Unknown"),
-            formatted_address=result.get("formatted_address"),
-            international_phone_number=result.get("international_phone_number"),
-            rating=result.get("rating"),
-            user_ratings_total=result.get("user_ratings_total"),
-            opening_hours=result.get("opening_hours"),
-            website=result.get("website"),
-            url=result.get("url"),
-            geometry=result.get("geometry"),
-        )
-
-
-# Root redirect/help
-@app.get("/", include_in_schema=False)
-def root_help():
-    """Basic index route redirecting users to API docs."""
-    return {"message": "Nearby Restaurant Finder API. Visit /docs for OpenAPI UI."}
+    return sample
